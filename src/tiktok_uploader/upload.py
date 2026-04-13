@@ -367,7 +367,9 @@ def complete_upload_form(
         _set_cover(page, cover_path)
     if not skip_split_window:
         _remove_split_window(page)
+    _dismiss_modals(page)
     _set_interactivity(page, **kwargs)
+    _dismiss_modals(page)
     _set_description(page, description)
     if visibility != "everyone":
         _set_visibility(page, visibility)
@@ -413,13 +415,24 @@ def _set_description(page: Page, description: str) -> None:
         desc_locator = page.locator(f"xpath={config.selectors.upload.description}")
         desc_locator.wait_for(state="visible", timeout=config.implicit_wait * 1000)
 
-        desc_locator.click()
+        # Dismiss any overlays that might intercept clicks
+        _dismiss_modals(page)
+
+        try:
+            desc_locator.click(timeout=5000)
+        except PlaywrightTimeoutError:
+            # Force click if normal click is intercepted by overlay
+            logger.debug("Normal click intercepted, using force click")
+            desc_locator.click(force=True)
 
         # Clear existing text
         desc_locator.press("Control+A")
         desc_locator.press("Backspace")
 
-        desc_locator.click()
+        try:
+            desc_locator.click(timeout=5000)
+        except PlaywrightTimeoutError:
+            desc_locator.click(force=True)
         time.sleep(1)
 
         words = description.split(" ")
@@ -549,6 +562,57 @@ def _remove_split_window(page: Page) -> None:
             window.click()
     except PlaywrightTimeoutError:
         logger.debug(red("Split window not found or operation timed out"))
+
+
+def _dismiss_modals(page: Page) -> None:
+    """
+    Dismisses any open modal overlays that may block interactions.
+    Handles react-joyride tutorial overlays, 'Got it' modals,
+    'Turn on automatic content checks' TUXModal, and floating-ui-portal overlays.
+    """
+    # 1. Dismiss react-joyride tutorial overlay
+    try:
+        overlay = page.locator("#react-joyride-portal .react-joyride__overlay")
+        if overlay.is_visible(timeout=2000):
+            overlay.click()
+            time.sleep(0.5)
+    except Exception:
+        pass
+
+    # 2. Dismiss 'Got it' button modal
+    try:
+        got_it_button = page.get_by_role("button", name="Got it", exact=False)
+        if got_it_button.is_visible(timeout=2000):
+            logger.debug(green("Dismissing 'Got it' modal"))
+            got_it_button.click()
+            time.sleep(1)
+    except Exception:
+        pass
+
+    # 3. Press Escape to dismiss any TUXModal / floating-ui-portal overlay
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+    # 4. Force-remove floating-ui-portal overlays via JS
+    try:
+        page.evaluate("""
+            document.querySelectorAll('[data-floating-ui-portal]').forEach(el => el.remove());
+        """)
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    # 5. Remove any remaining react-joyride portal
+    try:
+        page.evaluate("""
+            const portal = document.getElementById('react-joyride-portal');
+            if (portal) portal.remove();
+        """)
+    except Exception:
+        pass
 
 
 def _set_interactivity(
@@ -756,11 +820,16 @@ def _post_video(page: Page) -> None:
     """
     logger.debug(green("Clicking the post button"))
 
+    _dismiss_modals(page)
+
     post_btn = page.locator(f"xpath={config.selectors.upload.post}")
     try:
 
         def is_enabled():
-            return post_btn.get_attribute("data-disabled") == "false"
+            try:
+                return post_btn.get_attribute("data-disabled", timeout=2000) == "false"
+            except Exception:
+                return True  # If attribute doesn't exist, assume enabled
 
         for _ in range(int(config.uploading_wait / 2)):
             if is_enabled():
@@ -772,7 +841,31 @@ def _post_video(page: Page) -> None:
 
     except Exception:
         logger.debug(green("Trying to click on the button again (fallback)"))
-        page.evaluate('document.querySelector(".TUXButton--primary").click()')
+        _dismiss_modals(page)
+        try:
+            # Try multiple selectors for the post button
+            fallback_selectors = [
+                "button.TUXButton--primary",
+                ".TUXButton--primary",
+                "button[data-e2e='post_video_button']",
+            ]
+            clicked = False
+            for selector in fallback_selectors:
+                try:
+                    btn = page.locator(selector).first
+                    if btn.is_visible(timeout=2000):
+                        btn.scroll_into_view_if_needed()
+                        btn.click(force=True)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                # Last resort: find any button with "Post" text
+                post_text_btn = page.locator("button").filter(has_text="Post").first
+                post_text_btn.click(force=True)
+        except Exception as e:
+            logger.error(f"All post button fallbacks failed: {e}")
 
     try:
         post_now = page.locator(f"xpath={config.selectors.upload.post_now}")
